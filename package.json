@@ -1,7 +1,7 @@
 {
   "name": "tizenbrew-filmix-speed",
-  "version": "1.0.1",
-  "description": "Filmix TV with playback speed control from the remote (CH+/CH-, yellow key)",
+  "version": "1.1.0",
+  "description": "Filmix TV with a playback speed button in the player, next to translation and quality (also CH+/CH-, yellow key)",
   "packageType": "mods",
   "appName": "Filmix Speed",
   "websiteURL": "https://filmix.tv/",
