@@ -1,11 +1,11 @@
 {
   "name": "tizenbrew-filmix-speed",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Filmix TV with a playback speed button in the player, next to translation and quality (also CH+/CH-, yellow key)",
   "packageType": "mods",
   "appName": "Filmix Speed",
   "websiteURL": "https://filmix.tv/",
   "main": "speed.js",
-  "keys": ["ChannelUp", "ChannelDown", "ColorF2Yellow"],
+  "keys": ["ChannelUp", "ChannelDown", "ColorF2Yellow", "ColorF3Blue"],
   "license": "MIT"
 }

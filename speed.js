@@ -266,3 +266,203 @@
 
   setInterval(tick, 500);
 })();
+
+// Test build only: the blue key checks whether this TV can play sped-up sound through Web Audio.
+// It downloads the audio of the current 10 s piece, speeds it up without pitch change, plays 5 s
+// and shows on screen how long each stage took.
+(function () {
+  if (window.__filmixProbeLoaded) return;
+  window.__filmixProbeLoaded = true;
+
+  var BLUE = 406;
+  var SEGMENT = /seg-\d+-v1-a1\.ts/;
+  var lastSegmentUrl = null;
+  var report = null;
+  var lines = [];
+
+  // Remembers the last movie piece hls.js asked for.
+  var originalOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    if (SEGMENT.test(String(url))) lastSegmentUrl = String(url);
+    return originalOpen.apply(this, arguments);
+  };
+
+  // Returns the last movie piece URL: from the hook, else from the browser's load list.
+  function findSegmentUrl() {
+    if (lastSegmentUrl || !window.performance || !performance.getEntriesByType) return lastSegmentUrl;
+    var entries = performance.getEntriesByType('resource');
+    for (var i = entries.length - 1; i >= 0; i--) {
+      if (SEGMENT.test(entries[i].name)) return entries[i].name;
+    }
+    return null;
+  }
+
+  // Adds a line to the on-screen report.
+  function log(text) {
+    lines.push(text);
+    if (!report) {
+      report = document.createElement('div');
+      report.id = 'fxs-probe';
+      report.style.cssText = 'position:fixed;left:60px;top:60px;z-index:2147483647;max-width:1100px;padding:24px 32px;' +
+        'border-radius:20px;background:rgba(22,22,22,0.95);border:2px solid #eb5e28;color:#fffcf2;' +
+        'font:500 26px/1.45 "Euclid Circular A",sans-serif;white-space:pre-wrap';
+      document.body.appendChild(report);
+    }
+    report.textContent = lines.join('\n');
+  }
+
+  // Milliseconds since start, as text.
+  function since(start) {
+    return (Date.now() - start) + ' мс';
+  }
+
+  // Downloads a URL as bytes; calls done(bytes) or done(null, error).
+  function download(url, done) {
+    var xhr = new XMLHttpRequest();
+    originalOpen.call(xhr, 'GET', url);
+    xhr.responseType = 'arraybuffer';
+    xhr.onload = function () {
+      if (xhr.status === 200) done(new Uint8Array(xhr.response));
+      else done(null, 'HTTP ' + xhr.status);
+    };
+    xhr.onerror = function () { done(null, 'сеть'); };
+    xhr.send();
+  }
+
+  // Takes the AAC (ADTS) audio out of an MPEG-TS piece.
+  function extractAdts(bytes) {
+    var audioPid = -1;
+    var parts = [];
+    var total = 0;
+    for (var i = 0; i + 188 <= bytes.length; i += 188) {
+      if (bytes[i] !== 0x47) continue;
+      var pid = ((bytes[i + 1] & 31) << 8) | bytes[i + 2];
+      var start = (bytes[i + 1] & 64) !== 0;
+      var adaptation = (bytes[i + 3] >> 4) & 3;
+      var offset = i + 4;
+      if (adaptation & 2) offset += 1 + bytes[offset];
+      if (!(adaptation & 1) || offset >= i + 188) continue;
+      if (start && bytes[offset] === 0 && bytes[offset + 1] === 0 && bytes[offset + 2] === 1) {
+        if (audioPid < 0 && bytes[offset + 3] >= 0xc0 && bytes[offset + 3] <= 0xdf) audioPid = pid;
+        if (pid === audioPid) offset += 9 + bytes[offset + 8];
+      }
+      if (pid !== audioPid) continue;
+      parts.push(bytes.subarray(offset, i + 188));
+      total += i + 188 - offset;
+    }
+    var adts = new Uint8Array(total);
+    var position = 0;
+    for (var p = 0; p < parts.length; p++) {
+      adts.set(parts[p], position);
+      position += parts[p].length;
+    }
+    return adts;
+  }
+
+  // Speeds up decoded audio by rate without changing pitch (WSOLA), mixed down to stereo.
+  function stretch(context, buffer, rate) {
+    var length = buffer.length;
+    var channels = [];
+    for (var c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c));
+    var left = new Float32Array(length);
+    var right = new Float32Array(length);
+    for (var i = 0; i < length; i++) {
+      var center = channels.length > 2 ? channels[2][i] * 0.707 : 0;
+      left[i] = (channels[0][i] + center + (channels.length > 4 ? channels[4][i] * 0.5 : 0)) * 0.6;
+      right[i] = ((channels[1] || channels[0])[i] + center + (channels.length > 5 ? channels[5][i] * 0.5 : 0)) * 0.6;
+    }
+    var frame = 1920;
+    var hop = frame / 2;
+    var search = 480;
+    var out = context.createBuffer(2, Math.floor(length / rate) + frame, buffer.sampleRate);
+    var outLeft = out.getChannelData(0);
+    var outRight = out.getChannelData(1);
+    var outPosition = 0;
+    var previousEnd = 0;
+    while (true) {
+      var target = Math.round(outPosition * rate);
+      if (target + frame + search >= length) break;
+      var best = target;
+      var bestScore = -Infinity;
+      if (outPosition > 0) {
+        for (var shift = -search; shift <= search; shift += 8) {
+          var candidate = target + shift;
+          if (candidate < 0) continue;
+          var score = 0;
+          for (var j = 0; j < hop; j += 4) {
+            score += (left[candidate + j] + right[candidate + j]) * (left[previousEnd + j] + right[previousEnd + j]);
+          }
+          if (score > bestScore) {
+            bestScore = score;
+            best = candidate;
+          }
+        }
+      }
+      for (j = 0; j < frame; j++) {
+        var weight = 0.5 - 0.5 * Math.cos(2 * Math.PI * j / frame);
+        outLeft[outPosition + j] += left[best + j] * weight;
+        outRight[outPosition + j] += right[best + j] * weight;
+      }
+      previousEnd = best + hop;
+      outPosition += hop;
+    }
+    return out;
+  }
+
+  // Runs the whole check and reports each stage on screen.
+  function runProbe() {
+    lines = [];
+    var video = document.getElementById('video-player') || document.getElementsByTagName('video')[0];
+    var rate = video && video.playbackRate > 1 ? video.playbackRate : 2;
+    var match = navigator.userAgent.match(/Chrome\/[\d.]+/);
+    log('ПРОВЕРКА ЗВУКА (синяя кнопка ещё раз - закрыть)');
+    log('Браузер: ' + (match ? match[0] : navigator.userAgent.slice(0, 60)) + ', ядер: ' + (navigator.hardwareConcurrency || '?'));
+    var AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return log('ОШИБКА: нет Web Audio');
+    var segmentUrl = findSegmentUrl();
+    if (!segmentUrl) return log('ОШИБКА: фильм ещё не загрузился, подождите 10 сек и нажмите снова');
+    var context = window.__filmixProbeContext || new AudioContextClass();
+    window.__filmixProbeContext = context;
+    log('Web Audio: есть, состояние ' + (context.state || '?') + ', ' + context.sampleRate + ' Гц');
+    var started = Date.now();
+    download(segmentUrl.replace('-v1-a1.ts', '-a1.ts'), function (bytes, error) {
+      if (!bytes) return log('ОШИБКА скачивания звука: ' + error);
+      log('1. Скачан звук: ' + Math.round(bytes.length / 1024) + ' КБ за ' + since(started));
+      var adts = extractAdts(bytes);
+      if (!adts.length) return log('ОШИБКА: звук в куске не найден');
+      var decodeStart = Date.now();
+      context.decodeAudioData(adts.buffer, function (buffer) {
+        log('2. Декодирован: ' + buffer.duration.toFixed(1) + ' сек, ' + buffer.numberOfChannels + ' кан., ' +
+          buffer.sampleRate + ' Гц за ' + since(decodeStart));
+        var stretchStart = Date.now();
+        var fast = stretch(context, buffer, rate);
+        log('3. Ускорен до ' + rate + 'x за ' + since(stretchStart) + ' (на 10 сек фильма)');
+        if (context.resume) context.resume();
+        var source = context.createBufferSource();
+        source.buffer = fast;
+        source.connect(context.destination);
+        source.onended = function () { log('5. Готово. Сфотографируйте этот экран.'); };
+        source.start(0, 0, Math.min(5, fast.duration));
+        log('4. ИГРАЕТ 5 сек ускоренного звука. Слышно?');
+      }, function () {
+        log('ОШИБКА: телевизор не смог декодировать звук');
+      });
+    });
+  }
+
+  window.addEventListener('keydown', function (event) {
+    if (event.keyCode !== BLUE) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (report && report.parentNode) {
+      report.parentNode.removeChild(report);
+      report = null;
+      return;
+    }
+    try {
+      runProbe();
+    } catch (error) {
+      log('ОШИБКА: ' + error.message);
+    }
+  }, true);
+})();
