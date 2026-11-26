@@ -6,7 +6,7 @@
   if (window.__filmixSpeedLoaded) return;
   window.__filmixSpeedLoaded = true;
 
-  var SPEEDS = [2, 1.75, 1.5, 1.25, 1, 0.75];
+  var SPEEDS = [2.5, 2.25, 2, 1.75, 1.5, 1];
   var STORAGE_KEY = 'filmixSpeed';
   var AUTO_CLOSE_MS = 4000;
   var KEY = { up: 38, down: 40, enter: 13, back: 10009, chUp: 427, chDown: 428, yellow: 405 };
