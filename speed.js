@@ -8,7 +8,7 @@
   if (window.__filmixSpeedLoaded) return;
   window.__filmixSpeedLoaded = true;
 
-  var SPEEDS = [2.5, 2.25, 2, 1.75, 1.5, 1];
+  var SPEEDS = [2, 1.75, 1.5, 1];
   var STORAGE_KEY = 'filmixSpeed';
   var AUTO_CLOSE_MS = 4000;
   var PANEL_NAME = 'speed-panel';
@@ -267,71 +267,129 @@
   setInterval(tick, 500);
 })();
 
-// Test build only: the blue key checks whether this TV can play sped-up sound through Web Audio.
-// It downloads the audio of the current 10 s piece, speeds it up without pitch change, plays 5 s
-// and shows on screen how long each stage took.
+// Sound at higher speed. The TV mutes its own player at any speed but 1x, so this part downloads
+// the movie's audio-only pieces itself, speeds them up without changing pitch (WSOLA) and plays
+// them through Web Audio in step with the video. It only watches video.playbackRate.
+// Audio-only pieces are cut every ~10 s, not where the video pieces are, so each piece is placed
+// by the timestamp (PTS) inside it, counted from the first piece's timestamp.
 (function () {
-  if (window.__filmixProbeLoaded) return;
-  window.__filmixProbeLoaded = true;
+  if (window.__filmixSpeedAudioLoaded) return;
+  window.__filmixSpeedAudioLoaded = true;
 
-  var BLUE = 406;
+  var AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  var IS_TIZEN = /Tizen/.test(navigator.userAgent);
   var SEGMENT = /seg-\d+-v1-a1\.ts/;
-  var lastSegmentUrl = null;
-  var report = null;
-  var lines = [];
+  var PIECE_SECONDS = 10;
+  var AHEAD_SECONDS = 25;
+  var START_LEAD = 0.05;
+  var MAX_DRIFT = 0.15;
+  var FRAME = 1920;
+  var HOP = 960;
+  var SEARCH = 480;
+  var SLICE_MS = 25;
 
-  // Remembers the last movie piece hls.js asked for.
+  var context = null;
+  var hookedPlaylistUrl = null;
+  var playlistUrl = null;
+  var playlistLoading = null;
+  var pieceTemplate = null;
+  var basePts = null;
+  var pieces = {};
+  var missing = {};
+  var busy = false;
+  var scheduled = [];
+  var activeRate = 1;
+  var generation = 0;
+  var failed = false;
+  var driftStrikes = 0;
+  var videoGain = null;
+  var notice = null;
+
+  // With hls.js the <video> holds a blob, so the playlist URL is taken from its request.
   var originalOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (method, url) {
-    if (SEGMENT.test(String(url))) lastSegmentUrl = String(url);
+    if (/\.m3u8/.test(String(url))) hookedPlaylistUrl = String(url);
     return originalOpen.apply(this, arguments);
   };
 
-  // Returns the last movie piece URL: from the hook, else from the browser's load list.
-  function findSegmentUrl() {
-    if (lastSegmentUrl || !window.performance || !performance.getEntriesByType) return lastSegmentUrl;
+  // Shows a short message at the top right, for problems only.
+  function showNotice(text) {
+    if (!notice) {
+      notice = document.createElement('div');
+      notice.style.cssText = 'position:fixed;top:48px;right:60px;z-index:2147483647;padding:12px 26px;border-radius:12px;' +
+        'background:#252422;border:2px solid #eb5e28;color:#fffcf2;font:600 26px "Euclid Circular A",sans-serif';
+      document.body.appendChild(notice);
+    }
+    notice.textContent = text;
+    notice.style.display = 'block';
+    setTimeout(function () { notice.style.display = 'none'; }, 6000);
+  }
+
+  // Returns the movie <video>, or null outside the player.
+  function findVideo() {
+    return document.getElementById('video-player');
+  }
+
+  // Returns the URL of the playlist that lists the movie's pieces.
+  function findPlaylistUrl(video) {
+    var source = video.currentSrc || video.src || '';
+    if (/\.m3u8/.test(source)) return source;
+    if (hookedPlaylistUrl || !window.performance || !performance.getEntriesByType) return hookedPlaylistUrl;
     var entries = performance.getEntriesByType('resource');
     for (var i = entries.length - 1; i >= 0; i--) {
-      if (SEGMENT.test(entries[i].name)) return entries[i].name;
+      if (/\.m3u8/.test(entries[i].name)) return entries[i].name;
     }
     return null;
   }
 
-  // Adds a line to the on-screen report.
-  function log(text) {
-    lines.push(text);
-    if (!report) {
-      report = document.createElement('div');
-      report.id = 'fxs-probe';
-      report.style.cssText = 'position:fixed;left:60px;top:60px;z-index:2147483647;max-width:1100px;padding:24px 32px;' +
-        'border-radius:20px;background:rgba(22,22,22,0.95);border:2px solid #eb5e28;color:#fffcf2;' +
-        'font:500 26px/1.45 "Euclid Circular A",sans-serif;white-space:pre-wrap';
-      document.body.appendChild(report);
-    }
-    report.textContent = lines.join('\n');
-  }
-
-  // Milliseconds since start, as text.
-  function since(start) {
-    return (Date.now() - start) + ' мс';
-  }
-
-  // Downloads a URL as bytes; calls done(bytes) or done(null, error).
-  function download(url, done) {
+  // Downloads a URL; type is 'text' or 'arraybuffer'. Calls done(result) or done(null, status).
+  function download(url, type, done) {
     var xhr = new XMLHttpRequest();
     originalOpen.call(xhr, 'GET', url);
-    xhr.responseType = 'arraybuffer';
-    xhr.onload = function () {
-      if (xhr.status === 200) done(new Uint8Array(xhr.response));
-      else done(null, 'HTTP ' + xhr.status);
-    };
-    xhr.onerror = function () { done(null, 'сеть'); };
+    xhr.responseType = type;
+    xhr.onload = function () { done(xhr.status === 200 ? xhr.response : null, xhr.status); };
+    xhr.onerror = function () { done(null, 0); };
     xhr.send();
   }
 
-  // Takes the AAC (ADTS) audio out of an MPEG-TS piece.
-  function extractAdts(bytes) {
+  // URL of audio-only piece number k (1-based), built from any video piece URL.
+  function pieceUrl(k) {
+    return pieceTemplate.replace(SEGMENT, 'seg-' + k + '-a1.ts');
+  }
+
+  // Reads the playlist for a piece URL to build on, then the first audio piece for the base timestamp.
+  function loadSource(url) {
+    playlistLoading = url;
+    download(url, 'text', function (text) {
+      var match = text && text.match(/^[^#\s].*seg-\d+-v1-a1\.ts.*$/m);
+      if (!match) {
+        playlistLoading = null;
+        return giveUp('незнакомый формат потока');
+      }
+      var line = match[0].trim();
+      var template = /^https?:/.test(line) ? line : url.slice(0, url.lastIndexOf('/') + 1) + line;
+      download(template.replace(SEGMENT, 'seg-1-a1.ts'), 'arraybuffer', function (data) {
+        playlistLoading = null;
+        var first = data && extractAudio(new Uint8Array(data));
+        if (!first || first.pts === null) return;
+        reset();
+        pieceTemplate = template;
+        basePts = first.pts;
+        playlistUrl = url;
+      });
+    });
+  }
+
+  // Reads a 33-bit MPEG timestamp (in seconds) from 5 bytes of a PES header.
+  function readPts(bytes, at) {
+    return ((bytes[at] & 0x0e) * 536870912 + (bytes[at + 1] << 22) + ((bytes[at + 2] >> 1) << 15) +
+      (bytes[at + 3] << 7) + (bytes[at + 4] >> 1)) / 90000;
+  }
+
+  // Takes the AAC (ADTS) audio and its first timestamp out of an MPEG-TS piece.
+  function extractAudio(bytes) {
     var audioPid = -1;
+    var pts = null;
     var parts = [];
     var total = 0;
     for (var i = 0; i + 188 <= bytes.length; i += 188) {
@@ -344,7 +402,10 @@
       if (!(adaptation & 1) || offset >= i + 188) continue;
       if (start && bytes[offset] === 0 && bytes[offset + 1] === 0 && bytes[offset + 2] === 1) {
         if (audioPid < 0 && bytes[offset + 3] >= 0xc0 && bytes[offset + 3] <= 0xdf) audioPid = pid;
-        if (pid === audioPid) offset += 9 + bytes[offset + 8];
+        if (pid === audioPid) {
+          if (pts === null && (bytes[offset + 7] & 0x80)) pts = readPts(bytes, offset + 9);
+          offset += 9 + bytes[offset + 8];
+        }
       }
       if (pid !== audioPid) continue;
       parts.push(bytes.subarray(offset, i + 188));
@@ -356,113 +417,263 @@
       adts.set(parts[p], position);
       position += parts[p].length;
     }
-    return adts;
+    return { adts: adts, pts: pts };
   }
 
-  // Speeds up decoded audio by rate without changing pitch (WSOLA), mixed down to stereo.
-  function stretch(context, buffer, rate) {
+  // Mixes decoded audio (mono, stereo or 5.1) down to stereo, with silence padding at the end.
+  function mixToStereo(buffer, padding) {
     var length = buffer.length;
     var channels = [];
     for (var c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c));
-    var left = new Float32Array(length);
-    var right = new Float32Array(length);
+    var left = new Float32Array(length + padding);
+    var right = new Float32Array(length + padding);
+    var hasSurround = channels.length >= 6;
     for (var i = 0; i < length; i++) {
-      var center = channels.length > 2 ? channels[2][i] * 0.707 : 0;
-      left[i] = (channels[0][i] + center + (channels.length > 4 ? channels[4][i] * 0.5 : 0)) * 0.6;
-      right[i] = ((channels[1] || channels[0])[i] + center + (channels.length > 5 ? channels[5][i] * 0.5 : 0)) * 0.6;
+      if (hasSurround) {
+        var center = channels[2][i] * 0.707;
+        left[i] = (channels[0][i] + center + channels[4][i] * 0.5) * 0.55;
+        right[i] = (channels[1][i] + center + channels[5][i] * 0.5) * 0.55;
+      } else {
+        left[i] = channels[0][i];
+        right[i] = (channels[1] || channels[0])[i];
+      }
     }
-    var frame = 1920;
-    var hop = frame / 2;
-    var search = 480;
-    var out = context.createBuffer(2, Math.floor(length / rate) + frame, buffer.sampleRate);
+    return { left: left, right: right, length: length };
+  }
+
+  // Speeds audio up by rate without changing pitch (WSOLA), in small slices so the remote stays responsive.
+  function stretch(buffer, rate, isCurrent, done) {
+    var input = mixToStereo(buffer, FRAME + 2 * SEARCH);
+    var out = context.createBuffer(2, Math.ceil(input.length / rate) + FRAME, buffer.sampleRate);
     var outLeft = out.getChannelData(0);
     var outRight = out.getChannelData(1);
     var outPosition = 0;
     var previousEnd = 0;
-    while (true) {
-      var target = Math.round(outPosition * rate);
-      if (target + frame + search >= length) break;
-      var best = target;
-      var bestScore = -Infinity;
-      if (outPosition > 0) {
-        for (var shift = -search; shift <= search; shift += 8) {
-          var candidate = target + shift;
-          if (candidate < 0) continue;
-          var score = 0;
-          for (var j = 0; j < hop; j += 4) {
-            score += (left[candidate + j] + right[candidate + j]) * (left[previousEnd + j] + right[previousEnd + j]);
-          }
-          if (score > bestScore) {
-            bestScore = score;
-            best = candidate;
+
+    function slice() {
+      if (!isCurrent()) return;
+      var until = Date.now() + SLICE_MS;
+      while (Date.now() < until) {
+        var target = Math.round(outPosition * rate);
+        if (target >= input.length) return done(out);
+        var best = target;
+        if (outPosition > 0) {
+          var bestScore = -Infinity;
+          for (var shift = -SEARCH; shift <= SEARCH; shift += 8) {
+            var candidate = target + shift;
+            if (candidate < 0) continue;
+            var score = 0;
+            for (var j = 0; j < HOP; j += 4) {
+              score += (input.left[candidate + j] + input.right[candidate + j]) *
+                (input.left[previousEnd + j] + input.right[previousEnd + j]);
+            }
+            if (score > bestScore) {
+              bestScore = score;
+              best = candidate;
+            }
           }
         }
+        for (j = 0; j < FRAME; j++) {
+          var weight = 0.5 - 0.5 * Math.cos(2 * Math.PI * j / FRAME);
+          outLeft[outPosition + j] += input.left[best + j] * weight;
+          outRight[outPosition + j] += input.right[best + j] * weight;
+        }
+        previousEnd = best + HOP;
+        outPosition += HOP;
       }
-      for (j = 0; j < frame; j++) {
-        var weight = 0.5 - 0.5 * Math.cos(2 * Math.PI * j / frame);
-        outLeft[outPosition + j] += left[best + j] * weight;
-        outRight[outPosition + j] += right[best + j] * weight;
-      }
-      previousEnd = best + hop;
-      outPosition += hop;
+      setTimeout(slice, 0);
     }
-    return out;
+    slice();
   }
 
-  // Runs the whole check and reports each stage on screen.
-  function runProbe() {
-    lines = [];
-    var video = document.getElementById('video-player') || document.getElementsByTagName('video')[0];
-    var rate = video && video.playbackRate > 1 ? video.playbackRate : 2;
-    var match = navigator.userAgent.match(/Chrome\/[\d.]+/);
-    log('ПРОВЕРКА ЗВУКА (синяя кнопка ещё раз - закрыть)');
-    log('Браузер: ' + (match ? match[0] : navigator.userAgent.slice(0, 60)) + ', ядер: ' + (navigator.hardwareConcurrency || '?'));
-    var AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    if (!AudioContextClass) return log('ОШИБКА: нет Web Audio');
-    var segmentUrl = findSegmentUrl();
-    if (!segmentUrl) return log('ОШИБКА: фильм ещё не загрузился, подождите 10 сек и нажмите снова');
-    var context = window.__filmixProbeContext || new AudioContextClass();
-    window.__filmixProbeContext = context;
-    log('Web Audio: есть, состояние ' + (context.state || '?') + ', ' + context.sampleRate + ' Гц');
-    var started = Date.now();
-    download(segmentUrl.replace('-v1-a1.ts', '-a1.ts'), function (bytes, error) {
-      if (!bytes) return log('ОШИБКА скачивания звука: ' + error);
-      log('1. Скачан звук: ' + Math.round(bytes.length / 1024) + ' КБ за ' + since(started));
-      var adts = extractAdts(bytes);
-      if (!adts.length) return log('ОШИБКА: звук в куске не найден');
-      var decodeStart = Date.now();
-      context.decodeAudioData(adts.buffer, function (buffer) {
-        log('2. Декодирован: ' + buffer.duration.toFixed(1) + ' сек, ' + buffer.numberOfChannels + ' кан., ' +
-          buffer.sampleRate + ' Гц за ' + since(decodeStart));
-        var stretchStart = Date.now();
-        var fast = stretch(context, buffer, rate);
-        log('3. Ускорен до ' + rate + 'x за ' + since(stretchStart) + ' (на 10 сек фильма)');
-        if (context.resume) context.resume();
-        var source = context.createBufferSource();
-        source.buffer = fast;
-        source.connect(context.destination);
-        source.onended = function () { log('5. Готово. Сфотографируйте этот экран.'); };
-        source.start(0, 0, Math.min(5, fast.duration));
-        log('4. ИГРАЕТ 5 сек ускоренного звука. Слышно?');
+  // Downloads, decodes and speeds up audio piece k; its movie time comes from its timestamp.
+  function prepare(k) {
+    var myGeneration = generation;
+    var rate = activeRate;
+    var isCurrent = function () { return myGeneration === generation; };
+    busy = true;
+    download(pieceUrl(k), 'arraybuffer', function (data, status) {
+      if (!isCurrent()) return;
+      busy = false;
+      if (!data) {
+        if (status === 404) missing[k] = true;
+        return;
+      }
+      var audio = extractAudio(new Uint8Array(data));
+      if (!audio.adts.length || audio.pts === null) return giveUp('звук в потоке не найден');
+      busy = true;
+      context.decodeAudioData(audio.adts.buffer, function (decoded) {
+        if (!isCurrent()) return;
+        stretch(decoded, rate, isCurrent, function (buffer) {
+          pieces[k] = { start: audio.pts - basePts, duration: decoded.duration, buffer: buffer };
+          busy = false;
+        });
       }, function () {
-        log('ОШИБКА: телевизор не смог декодировать звук');
+        if (isCurrent()) giveUp('телевизор не смог декодировать звук');
       });
     });
   }
 
-  window.addEventListener('keydown', function (event) {
-    if (event.keyCode !== BLUE) return;
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    if (report && report.parentNode) {
-      report.parentNode.removeChild(report);
-      report = null;
+  // Number of the audio piece that should contain movie time t, corrected by pieces already known.
+  function pieceIndexAt(t) {
+    var k = Math.floor(t / PIECE_SECONDS) + 1;
+    var piece = pieces[k];
+    if (piece && t < piece.start && k > 1) return k - 1;
+    if (piece && t >= piece.start + piece.duration) return k + 1;
+    return k;
+  }
+
+  // Stops trying for this page and says why; the speed itself keeps working.
+  function giveUp(reason) {
+    failed = true;
+    deactivate();
+    showNotice('Звук на скорости недоступен: ' + reason);
+  }
+
+  // Starts every prepared piece from the current one onward that is not playing yet.
+  function schedule(video) {
+    var now = context.currentTime;
+    var t = video.currentTime;
+    for (var k = pieceIndexAt(t); pieces[k] && pieces[k].start < t + AHEAD_SECONDS; k++) {
+      if (isScheduled(k)) continue;
+      var piece = pieces[k];
+      var when = Math.max(now + START_LEAD, now + (piece.start - t) / activeRate);
+      var movieOffset = t + (when - now) * activeRate - piece.start;
+      if (movieOffset >= piece.duration) continue;
+      var node = context.createBufferSource();
+      node.buffer = piece.buffer;
+      node.connect(context.destination);
+      node.start(when, movieOffset / activeRate, (piece.duration - movieOffset) / activeRate);
+      scheduled.push({ index: k, node: node, when: when, movieStart: piece.start + movieOffset,
+        end: when + (piece.duration - movieOffset) / activeRate });
+    }
+  }
+
+  // True if a piece is already queued to play.
+  function isScheduled(k) {
+    for (var i = 0; i < scheduled.length; i++) {
+      if (scheduled[i].index === k) return true;
+    }
+    return false;
+  }
+
+  // Stops all queued sound.
+  function stopAll() {
+    for (var i = 0; i < scheduled.length; i++) {
+      try { scheduled[i].node.stop(0); } catch (error) { /* already stopped */ }
+    }
+    scheduled = [];
+  }
+
+  // How far the sound playing now is from the picture, in movie seconds (null if silent).
+  function currentDrift(video) {
+    var now = context.currentTime;
+    for (var i = 0; i < scheduled.length; i++) {
+      var item = scheduled[i];
+      if (item.when <= now && item.end > now) return item.movieStart + (now - item.when) * activeRate - video.currentTime;
+    }
+    return null;
+  }
+
+  // Re-syncs when the sound has drifted away from the picture (seek, stall, clock drift).
+  function checkDrift(video) {
+    var now = context.currentTime;
+    scheduled = scheduled.filter(function (item) { return item.end > now; });
+    var drift = currentDrift(video);
+    if (drift === null) return;
+    driftStrikes = Math.abs(drift) > MAX_DRIFT ? driftStrikes + 1 : 0;
+    if (driftStrikes >= 2 || Math.abs(drift) > 1) {
+      driftStrikes = 0;
+      stopAll();
+    }
+  }
+
+  // Silences the video's own sound in browsers that do not mute it themselves (Filmix keeps unmuting it).
+  function silenceVideo(video, silent) {
+    if (IS_TIZEN || !context) return;
+    if (!videoGain) {
+      if (!silent || context.state !== 'running' || !/^blob:/.test(video.currentSrc)) return;
+      var source = context.createMediaElementSource(video);
+      videoGain = context.createGain();
+      source.connect(videoGain);
+      videoGain.connect(context.destination);
+    }
+    videoGain.gain.value = silent ? 0 : 1;
+  }
+
+  // Forgets all prepared sound, e.g. after a speed or source change.
+  function reset() {
+    generation++;
+    stopAll();
+    pieces = {};
+    missing = {};
+    busy = false;
+  }
+
+  // Turns our sound off and gives the video its own sound back.
+  function deactivate() {
+    if (activeRate !== 1) {
+      reset();
+      activeRate = 1;
+    }
+    var video = findVideo();
+    if (video) silenceVideo(video, false);
+  }
+
+  // Prepares the nearest piece ahead that has no sound yet, one at a time.
+  function prepareAhead(video) {
+    if (busy) return;
+    var t = video.currentTime;
+    for (var k = pieceIndexAt(t); (k - 1) * PIECE_SECONDS < t + AHEAD_SECONDS; k++) {
+      if (missing[k]) return;
+      if (!pieces[k]) return prepare(k);
+    }
+  }
+
+  // Drops sound of pieces already played, to keep memory low.
+  function dropOld(video) {
+    for (var key in pieces) {
+      if (pieces[key].start + pieces[key].duration < video.currentTime - 5) delete pieces[key];
+    }
+  }
+
+  // Four times a second: follow the video's speed, state and position.
+  function tick() {
+    var video = findVideo();
+    if (!video || !AudioContextClass || failed || video.playbackRate === 1 || video.playbackRate <= 0) {
+      deactivate();
       return;
     }
-    try {
-      runProbe();
-    } catch (error) {
-      log('ОШИБКА: ' + error.message);
+    if (!context) context = new AudioContextClass();
+    if (context.state === 'suspended' && context.resume) context.resume();
+    if (video.playbackRate !== activeRate) {
+      reset();
+      activeRate = video.playbackRate;
     }
-  }, true);
+    silenceVideo(video, true);
+    var url = findPlaylistUrl(video);
+    if (!url) return;
+    if (url !== playlistUrl) {
+      if (playlistLoading !== url) loadSource(url);
+      return;
+    }
+    prepareAhead(video);
+    if (video.paused || video.seeking || video.readyState < 3) {
+      stopAll();
+      return;
+    }
+    checkDrift(video);
+    schedule(video);
+    dropOld(video);
+  }
+
+  // For checking from the developer console: what the sound part is doing right now.
+  window.__filmixSpeedAudioState = function () {
+    var video = findVideo();
+    return { rate: activeRate, failed: failed, basePts: basePts, prepared: Object.keys(pieces),
+      scheduled: scheduled.map(function (item) { return item.index; }), busy: busy,
+      drift: context && video ? currentDrift(video) : null };
+  };
+
+  setInterval(tick, 250);
 })();
