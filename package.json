@@ -1,0 +1,11 @@
+{
+  "name": "tizenbrew-filmix-speed",
+  "version": "1.0.0",
+  "description": "Filmix TV with playback speed control from the remote (CH+/CH-, yellow key)",
+  "packageType": "mods",
+  "appName": "Filmix Speed",
+  "websiteURL": "https://filmix.tv/",
+  "main": "speed.js",
+  "keys": ["ChannelUp", "ChannelDown", "ColorF2Yellow"],
+  "license": "MIT"
+}

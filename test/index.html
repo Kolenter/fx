@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { margin: 0; width: 1920px; height: 1080px; background: #161616; overflow: hidden; }
+    #player { position: absolute; inset: 0; width: 1920px; height: 1080px; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+</head>
+<body>
+  <div class="f-bg-trailer"><video id="media-inside-trailer" class="f-bg-trailer__video" muted></video></div>
+  <video id="player" muted autoplay></video>
+  <script>
+    var log = [];
+    document.addEventListener('keydown', function (e) { log.push('filmix:' + e.keyCode); });
+    var hls = new Hls();
+    hls.loadSource('https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8');
+    hls.attachMedia(document.getElementById('player'));
+    function press(code) {
+      ['keydown', 'keyup'].forEach(function (type) {
+        var e = new KeyboardEvent(type, { bubbles: true, cancelable: true });
+        Object.defineProperty(e, 'keyCode', { get: function () { return code; } });
+        document.body.dispatchEvent(e);
+      });
+    }
+  </script>
+  <script src="../speed.js"></script>
+</body>
+</html>
