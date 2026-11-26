@@ -1,6 +1,6 @@
 {
   "name": "tizenbrew-filmix-speed",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Filmix TV playback speed up to 2x with sound, from a button next to translation and quality (also CH+/CH-, yellow key)",
   "packageType": "mods",
   "appName": "Filmix Speed",

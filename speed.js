@@ -302,6 +302,9 @@
   var generation = 0;
   var failed = false;
   var driftStrikes = 0;
+  var lastVideoTime = -1;
+  var lastVideoChangeAt = 0;
+  var videoTimeChanges = 0;
   var videoGain = null;
   var notice = null;
 
@@ -531,9 +534,9 @@
   }
 
   // Starts every prepared piece from the current one onward that is not playing yet.
-  function schedule(video) {
+  function schedule() {
     var now = context.currentTime;
-    var t = video.currentTime;
+    var t = videoNow();
     for (var k = pieceIndexAt(t); pieces[k] && pieces[k].start < t + AHEAD_SECONDS; k++) {
       if (isScheduled(k)) continue;
       var piece = pieces[k];
@@ -566,20 +569,20 @@
   }
 
   // How far the sound playing now is from the picture, in movie seconds (null if silent).
-  function currentDrift(video) {
+  function currentDrift() {
     var now = context.currentTime;
     for (var i = 0; i < scheduled.length; i++) {
       var item = scheduled[i];
-      if (item.when <= now && item.end > now) return item.movieStart + (now - item.when) * activeRate - video.currentTime;
+      if (item.when <= now && item.end > now) return item.movieStart + (now - item.when) * activeRate - videoNow();
     }
     return null;
   }
 
   // Re-syncs when the sound has drifted away from the picture (seek, stall, clock drift).
-  function checkDrift(video) {
+  function checkDrift() {
     var now = context.currentTime;
     scheduled = scheduled.filter(function (item) { return item.end > now; });
-    var drift = currentDrift(video);
+    var drift = currentDrift();
     if (drift === null) return;
     driftStrikes = Math.abs(drift) > MAX_DRIFT ? driftStrikes + 1 : 0;
     if (driftStrikes >= 2 || Math.abs(drift) > 1) {
@@ -618,6 +621,24 @@
     }
     var video = findVideo();
     if (video) silenceVideo(video, false);
+  }
+
+  // The TV reports "playing" before the picture really moves, so sound waits until the clock
+  // has moved a few times in a row, and pauses if it stands still for a second.
+  function isVideoMoving(video) {
+    var t = video.currentTime;
+    if (t !== lastVideoTime) {
+      if (Math.abs(t - lastVideoTime) > 2 * activeRate) videoTimeChanges = 0;
+      lastVideoTime = t;
+      lastVideoChangeAt = Date.now();
+      videoTimeChanges++;
+    }
+    return videoTimeChanges >= 3 && Date.now() - lastVideoChangeAt < 1000;
+  }
+
+  // Movie time now: the TV updates currentTime in steps, so it is carried forward between updates.
+  function videoNow() {
+    return lastVideoTime + Math.min(Date.now() - lastVideoChangeAt, 1000) / 1000 * activeRate;
   }
 
   // Prepares the nearest piece ahead that has no sound yet, one at a time.
@@ -659,11 +680,16 @@
     }
     prepareAhead(video);
     if (video.paused || video.seeking || video.readyState < 3) {
+      videoTimeChanges = 0;
       stopAll();
       return;
     }
-    checkDrift(video);
-    schedule(video);
+    if (!isVideoMoving(video)) {
+      stopAll();
+      return;
+    }
+    checkDrift();
+    schedule();
     dropOld(video);
   }
 
@@ -672,7 +698,7 @@
     var video = findVideo();
     return { rate: activeRate, failed: failed, basePts: basePts, prepared: Object.keys(pieces),
       scheduled: scheduled.map(function (item) { return item.index; }), busy: busy,
-      drift: context && video ? currentDrift(video) : null };
+      drift: context && video ? currentDrift() : null };
   };
 
   setInterval(tick, 250);
